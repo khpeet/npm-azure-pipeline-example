@@ -1,0 +1,20 @@
+# snmp-base.yaml — Base template for ktranslate SNMP global configuration.
+# Used by the CI/CD pipeline as the starting point for snmp-base.yaml generation.
+#
+# The pipeline reads this template and updates:
+#   - The header comments (container ID, timestamp, device count)
+#   - The global.mibs_enabled list (computed from all devices' discovered_mibs)
+#
+# devices: "@devices.yaml" — ktranslate resolves this @-include relative to
+# the config file path. Both files are mounted at the container root.
+#
+# Discovery is NEVER enabled per project requirements.
+
+devices:
+  "@devices.yaml"
+global:
+  poll_time_sec: 300
+  timeout_ms: 5000
+  retries: 0
+  mibs_enabled:
+    - IF-MIB

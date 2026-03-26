@@ -1,0 +1,37 @@
+# Step template: upload-config
+# Uploads updated devices.yaml and snmp-base.yaml to the target host via SCP.
+#
+# Parameters:
+#   sshEndpoint  — Azure DevOps SSH service connection name
+#   containerID  — unique container identifier; config is placed at /etc/ktranslate/{containerID}/
+#   sourceFolder — local folder containing devices.yaml and snmp-base.yaml to upload
+
+parameters:
+  - name: sshEndpoint
+    type: string
+  - name: containerID
+    type: string
+  - name: sourceFolder
+    type: string
+
+steps:
+  - task: CopyFilesOverSSH@0
+    displayName: "Upload updated config to host"
+    inputs:
+      sshEndpoint: ${{ parameters.sshEndpoint }}
+      sourceFolder: ${{ parameters.sourceFolder }}
+      contents: |
+        devices.yaml
+        snmp-base.yaml
+      targetFolder: /etc/ktranslate/${{ parameters.containerID }}/
+      readyTimeout: '20000'
+
+  - task: SSH@0
+    displayName: "Set readable permissions on config files"
+    inputs:
+      sshEndpoint: ${{ parameters.sshEndpoint }}
+      runOptions: inline
+      inline: |
+        chmod 644 /etc/ktranslate/${{ parameters.containerID }}/devices.yaml
+        chmod 644 /etc/ktranslate/${{ parameters.containerID }}/snmp-base.yaml
+        echo "Permissions set to 644 on devices.yaml and snmp-base.yaml for container read access"

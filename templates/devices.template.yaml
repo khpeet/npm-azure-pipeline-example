@@ -1,0 +1,7 @@
+# devices.yaml — Base template for ktranslate device inventory.
+# Used by the CI/CD pipeline as the starting point for devices.yaml generation.
+#
+# The pipeline reads this template and populates it with devices from the caller's
+# JSON input. Each device is keyed by device_name in a flat map structure.
+#
+# This file starts empty — devices are added by the create or add-devices actions.

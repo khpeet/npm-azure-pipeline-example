@@ -1,0 +1,92 @@
+# Action template: update-devices
+# Stage: UpdateDevices
+#
+# Applies patch-style updates to existing devices in devices.yaml, keyed by immutable
+# device_ip. Unspecified fields are preserved, device_name may be renamed, and the
+# polling container is restarted after the merged config is uploaded.
+#
+# Called from pipelines/manage-container.yml when action == 'update-devices'.
+
+parameters:
+  - name: containerID
+    type: string
+  - name: targetHost
+    type: string
+  - name: devices
+    type: string
+  - name: snmpCommunity
+    type: string
+
+stages:
+
+  # ============================================================
+  # Stage: UpdateDevices
+  # Fetch devices.yaml from host, apply patch updates by IP, upload updated config,
+  # then restart the polling container.
+  # ============================================================
+  - stage: UpdateDevices
+    displayName: "Update devices in ${{ parameters.containerID }}"
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - job: UpdateDevicesJob
+        displayName: "Fetch, patch, upload devices"
+        timeoutInMinutes: 10
+        steps:
+          - checkout: self
+
+          - template: ../templates/steps/install-python-deps.yml
+
+          - template: ../templates/steps/fetch-devices-b64.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+              containerID: ${{ parameters.containerID }}
+
+          - template: ../templates/steps/validate-fetched-devices.yml
+            parameters:
+              devicesB64Var: $(fetchDevices.currentDevicesB64)
+
+          - task: PythonScript@0
+            inputs:
+              scriptSource: filePath
+              scriptPath: $(Build.SourcesDirectory)/scripts/manage_devices.py
+              arguments: >-
+                --action update
+                --container-id "${{ parameters.containerID }}"
+                --output-dir "$(Build.ArtifactStagingDirectory)/updated-config"
+            displayName: "Apply device patches by IP"
+            env:
+              EXISTING_DEVICES_B64: $(fetchDevices.currentDevicesB64)
+              NEW_DEVICES_JSON:     '${{ parameters.devices }}'
+              SNMP_COMMUNITY:       ${{ parameters.snmpCommunity }}
+
+          - template: ../templates/steps/validate-config.yml
+            parameters:
+              sourceFolder: $(Build.ArtifactStagingDirectory)/updated-config
+
+          - template: ../templates/steps/backup-config.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+              containerID: ${{ parameters.containerID }}
+
+          - template: ../templates/steps/upload-config.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+              containerID: ${{ parameters.containerID }}
+              sourceFolder: $(Build.ArtifactStagingDirectory)/updated-config
+
+          - template: ../templates/steps/copy-scripts-to-host.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+
+          - template: ../templates/steps/restart-and-healthcheck.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+              containerID: ${{ parameters.containerID }}
+
+          - template: ../templates/steps/publish-result-to-nr.yml
+            parameters:
+              action: update-devices
+              containerID: ${{ parameters.containerID }}
+              targetHost: ${{ parameters.targetHost }}
+              details: "$(YAML_VALIDATION_ERRORS)"

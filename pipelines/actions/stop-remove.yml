@@ -1,0 +1,60 @@
+# Action template: stop-remove
+# Stage: Deploy (stop or remove)
+#
+# Handles the two simple lifecycle actions that require no config generation:
+#   stop   — runs manage-container.sh --action stop (stops container only; keeps container + config on host)
+#   remove — runs manage-container.sh --action remove (stops container, removes it, and deletes config dir)
+#
+# Called from pipelines/manage-container.yml when action == 'stop' or action == 'remove'.
+
+parameters:
+  - name: action
+    type: string
+    values:
+      - stop
+      - remove
+  - name: containerID
+    type: string
+  - name: targetHost
+    type: string
+
+stages:
+
+  # ============================================================
+  # Stage: Deploy
+  # Copies management scripts to host, then either stops the preserved container
+  # or removes both the container and its config directory.
+  # ============================================================
+  - stage: Deploy
+    displayName: "Deploy: ${{ parameters.action }} ${{ parameters.containerID }}"
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - job: DeployAction
+        displayName: "Run ${{ parameters.action }}"
+        timeoutInMinutes: 10
+        steps:
+          - checkout: self
+
+          - template: ../templates/steps/copy-scripts-to-host.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+
+          - task: SSH@0
+            displayName: "Execute: ${{ parameters.action }} ${{ parameters.containerID }}"
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              runOptions: inline
+              inline: |
+                chmod +x /etc/ktranslate/scripts/manage-container.sh
+                /etc/ktranslate/scripts/manage-container.sh \
+                  --action "${{ parameters.action }}" \
+                  --container-id "${{ parameters.containerID }}"
+
+          - template: ../templates/steps/publish-result-to-nr.yml
+            parameters:
+              action: ${{ parameters.action }}
+              containerID: ${{ parameters.containerID }}
+              targetHost: ${{ parameters.targetHost }}
+
+              details: "Container ${{ parameters.action }}"

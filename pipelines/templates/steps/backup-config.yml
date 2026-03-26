@@ -1,0 +1,31 @@
+# Step template: backup-config
+# Creates .bak copies of devices.yaml and snmp-base.yaml on the target host
+# before any config overwrite so the previous state can be recovered manually.
+#
+# Parameters:
+#   sshEndpoint — Azure DevOps SSH service connection name
+#   containerID — unique container identifier; config lives at /etc/ktranslate/{containerID}/
+
+parameters:
+  - name: sshEndpoint
+    type: string
+  - name: containerID
+    type: string
+
+steps:
+  - task: SSH@0
+    displayName: "Backup config on host"
+    inputs:
+      sshEndpoint: ${{ parameters.sshEndpoint }}
+      runOptions: inline
+      inline: |
+        CONFIG_DIR="/etc/ktranslate/${{ parameters.containerID }}"
+        TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
+        cp "$CONFIG_DIR/devices.yaml"    "$CONFIG_DIR/devices.yaml.bak.${TIMESTAMP}"
+        cp "$CONFIG_DIR/snmp-base.yaml"  "$CONFIG_DIR/snmp-base.yaml.bak.${TIMESTAMP}"
+        echo "Backed up devices.yaml and snmp-base.yaml (timestamp: ${TIMESTAMP})"
+
+        # Keep only the 5 most recent backups per file to avoid disk bloat
+        for pattern in devices.yaml.bak snmp-base.yaml.bak; do
+          ls -1t "$CONFIG_DIR"/${pattern}.* 2>/dev/null | tail -n +6 | xargs -r rm -f
+        done

@@ -1,0 +1,45 @@
+# Step template: publish-result-to-nr
+# Sends a pipeline result log to New Relic via the Log API.
+# Runs at the end of each action template to provide an audit trail.
+#
+# Parameters:
+#   action      — pipeline action (create, add-devices, remove-devices, start, stop, remove)
+#   containerID — unique container identifier
+#   targetHost  — SSH service connection name
+#   details     — optional free-text details (e.g., "3 devices added, 1 skipped")
+#
+# Result is determined at runtime from the Agent.JobStatus system variable so it
+# accurately reflects whether the job succeeded or failed (compile-time iif() always
+# evaluates to 'failure' because Agent.JobStatus has no value at template expansion time).
+#
+# Uses NR_INGEST_KEY from the newrelic-npm-secrets variable group.
+
+parameters:
+  - name: action
+    type: string
+  - name: containerID
+    type: string
+  - name: targetHost
+    type: string
+  - name: details
+    type: string
+    default: ""
+
+steps:
+  - task: PythonScript@0
+    inputs:
+      scriptSource: filePath
+      scriptPath: $(Build.SourcesDirectory)/scripts/publish_result_to_nr.py
+    displayName: "Publish result to New Relic"
+    condition: always()
+    env:
+      ACTION: ${{ parameters.action }}
+      CONTAINER_ID: ${{ parameters.containerID }}
+      TARGET_HOST: ${{ parameters.targetHost }}
+      DETAILS_RAW: ${{ parameters.details }}
+      AGENT_JOBSTATUS: $(Agent.JobStatus)
+      NR_INGEST_KEY: $(NR_INGEST_KEY)
+      BUILD_BUILDID: $(Build.BuildId)
+      SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+      SYSTEM_TEAMPROJECT: $(System.TeamProject)
+      BUILD_REQUESTEDFOR: $(Build.RequestedFor)

@@ -1,0 +1,232 @@
+# Action template: add-devices
+# Stages: ProbeDevices (opt-in) → AddDevices
+#
+# Appends new devices to an existing container's devices.yaml, restarts the poller.
+#   1. ProbeDevices — (opt-in) fingerprint new devices via temp ktranslate container
+#   2. AddDevices   — fetch current devices.yaml from host, dedup by IP, merge, upload, restart
+#
+# Called from pipelines/manage-container.yml when action == 'add-devices'.
+
+parameters:
+  - name: containerID
+    type: string
+  - name: targetHost
+    type: string
+  - name: devices
+    type: string
+  - name: snmpCommunity
+    type: string
+  - name: probeDevices
+    type: boolean
+
+stages:
+
+  # ============================================================
+  # Stage: ProbeDevices (opt-in)
+  # Runs a temporary ktranslate container on the host to fingerprint new devices.
+  # No Python, pyyaml, or jq required on the target host.
+  # ============================================================
+  - stage: ProbeDevices
+    displayName: "Probe devices (opt-in)"
+    dependsOn: Validate
+    condition: |
+      and(
+        succeeded(),
+        eq('${{ parameters.probeDevices }}', 'true')
+      )
+    jobs:
+      - job: RunProbe
+        displayName: "Run device probe"
+        timeoutInMinutes: 15
+        steps:
+          - checkout: self
+
+          # Step 1: Generate probe YAML on runner
+          - template: ../templates/steps/install-python-deps.yml
+
+          - task: PythonScript@0
+            inputs:
+              scriptSource: filePath
+              scriptPath: $(Build.SourcesDirectory)/scripts/generate_probe_config.py
+              arguments: >-
+                --output "$(Build.ArtifactStagingDirectory)/probe/snmp-probe.yaml"
+            displayName: "Generate probe config on runner"
+            env:
+              DEVICES_JSON:   ${{ parameters.devices }}
+              SNMP_COMMUNITY: ${{ parameters.snmpCommunity }}
+
+          # Step 2: Copy probe YAML + run-probe.sh to host
+          - task: CopyFilesOverSSH@0
+            displayName: "Copy probe config to host"
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              sourceFolder: $(Build.ArtifactStagingDirectory)/probe
+              contents: snmp-probe.yaml
+              targetFolder: /etc/ktranslate/probe-${{ parameters.containerID }}/
+              readyTimeout: '20000'
+
+          - task: CopyFilesOverSSH@0
+            displayName: "Copy run-probe.sh to host"
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              sourceFolder: $(Build.SourcesDirectory)/scripts
+              contents: run-probe.sh
+              targetFolder: /etc/ktranslate/scripts/
+              readyTimeout: '20000'
+
+          # Step 3: Run probe on host (docker run --rm with -snmp_out_file)
+          - task: SSH@0
+            displayName: "Run ktranslate discovery probe on host"
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              runOptions: inline
+              failOnStdErr: false
+              inline: |
+                chmod +x /etc/ktranslate/scripts/run-probe.sh
+                /etc/ktranslate/scripts/run-probe.sh \
+                  --container-id "${{ parameters.containerID }}"
+
+          # Step 4: Retrieve discovered-snmp.yaml from host as base64; clean up probe dir
+          - task: SSH@0
+            displayName: "Return discovery output to runner"
+            name: getDiscoveryOutput
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              runOptions: inline
+              inline: |
+                YAML_B64=$(base64 -w 0 /etc/ktranslate/probe-${{ parameters.containerID }}/discovered-snmp.yaml)
+                echo "##vso[task.setvariable variable=discoveredYamlB64;isOutput=true]$YAML_B64"
+                rm -rf /etc/ktranslate/probe-${{ parameters.containerID }}
+
+          # Step 5: Decode discovery output on runner, produce enriched devices.yaml
+          - bash: |
+              echo "$(getDiscoveryOutput.discoveredYamlB64)" | base64 -d \
+                > "$(Build.ArtifactStagingDirectory)/probe/discovered-snmp.yaml"
+            displayName: "Decode discovery output"
+
+          - task: PythonScript@0
+            inputs:
+              scriptSource: filePath
+              scriptPath: $(Build.SourcesDirectory)/scripts/merge_probe_results.py
+              arguments: >-
+                --container-id "${{ parameters.containerID }}"
+                --probe-yaml-path "$(Build.ArtifactStagingDirectory)/probe/discovered-snmp.yaml"
+                --output-dir "$(Build.ArtifactStagingDirectory)/probe-enriched"
+                --output-mode json
+            displayName: "Merge probe results into enriched devices JSON on runner"
+            env:
+              DEVICES_JSON:    '${{ parameters.devices }}'
+              SNMP_COMMUNITY:  '${{ parameters.snmpCommunity }}'
+
+          - publish: $(Build.ArtifactStagingDirectory)/probe-enriched
+            artifact: probe-enriched
+            displayName: "Publish enriched devices artifact"
+
+  # ============================================================
+  # Stage: AddDevices
+  # Fetch devices.yaml from host, merge new devices (dedup by IP), upload, restart.
+  # ============================================================
+  - stage: AddDevices
+    displayName: "Add devices to ${{ parameters.containerID }}"
+    dependsOn:
+      - Validate
+      - ProbeDevices
+    condition: |
+      and(
+        eq(dependencies.Validate.result, 'Succeeded'),
+        in(dependencies.ProbeDevices.result, 'Succeeded', 'Skipped')
+      )
+    jobs:
+      - job: AddDevicesJob
+        displayName: "Fetch, merge, upload devices"
+        timeoutInMinutes: 10
+        steps:
+          - checkout: self
+
+          - template: ../templates/steps/install-python-deps.yml
+
+          - template: ../templates/steps/fetch-devices-b64.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+              containerID: ${{ parameters.containerID }}
+
+          # Validate the fetched devices.yaml from the host before using it as merge input.
+          # If the host config is corrupted this halts the pipeline before any changes are made.
+          - template: ../templates/steps/validate-fetched-devices.yml
+            parameters:
+              devicesB64Var: $(fetchDevices.currentDevicesB64)
+
+          # If probeDevices=true, download the enriched artifact published by the ProbeDevices
+          # stage. Regular jobs do NOT auto-download cross-stage artifacts in Azure DevOps YAML
+          # pipelines, so an explicit download step is required or the file will never exist.
+          - ${{ if eq(parameters.probeDevices, true) }}:
+            - download: current
+              artifact: probe-enriched
+              displayName: "Download enriched devices artifact"
+
+          # If probeDevices=true the enriched artifact is available; use it as the devices list.
+          # Otherwise fall back to the raw caller-supplied devices JSON.
+          - bash: |
+              mkdir -p $(Build.ArtifactStagingDirectory)/updated-config
+
+              NEW_DEVICES_JSON="$DEFAULT_DEVICES_JSON"
+
+              if [ "${{ parameters.probeDevices }}" = "true" ] && \
+                 [ -f "$(Pipeline.Workspace)/probe-enriched/enriched-devices.json" ]; then
+                echo "Using probe-enriched devices from ProbeDevices stage"
+                NEW_DEVICES_JSON=$(cat "$(Pipeline.Workspace)/probe-enriched/enriched-devices.json")
+              fi
+
+              # Export for PythonScript env var consumption
+              echo "##vso[task.setvariable variable=RESOLVED_DEVICES_JSON]$NEW_DEVICES_JSON"
+            displayName: "Resolve devices JSON source"
+            env:
+              DEFAULT_DEVICES_JSON: ${{ parameters.devices }}
+
+          - task: PythonScript@0
+            inputs:
+              scriptSource: filePath
+              scriptPath: $(Build.SourcesDirectory)/scripts/manage_devices.py
+              arguments: >-
+                --action add
+                --container-id "${{ parameters.containerID }}"
+                --output-dir "$(Build.ArtifactStagingDirectory)/updated-config"
+            displayName: "Merge new devices (dedup by IP)"
+            env:
+              EXISTING_DEVICES_B64: $(fetchDevices.currentDevicesB64)
+              NEW_DEVICES_JSON:     $(RESOLVED_DEVICES_JSON)
+              SNMP_COMMUNITY:       ${{ parameters.snmpCommunity }}
+
+          # Validate generated devices.yaml and snmp-base.yaml BEFORE touching the host.
+          # If validation fails: backup is skipped (preserving last good backup), upload is
+          # skipped (host config unchanged), restart is skipped (container keeps running).
+          - template: ../templates/steps/validate-config.yml
+            parameters:
+              sourceFolder: $(Build.ArtifactStagingDirectory)/updated-config
+
+          - template: ../templates/steps/backup-config.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+              containerID: ${{ parameters.containerID }}
+
+          - template: ../templates/steps/upload-config.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+              containerID: ${{ parameters.containerID }}
+              sourceFolder: $(Build.ArtifactStagingDirectory)/updated-config
+
+          - template: ../templates/steps/copy-scripts-to-host.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+
+          - template: ../templates/steps/restart-and-healthcheck.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+              containerID: ${{ parameters.containerID }}
+
+          - template: ../templates/steps/publish-result-to-nr.yml
+            parameters:
+              action: add-devices
+              containerID: ${{ parameters.containerID }}
+              targetHost: ${{ parameters.targetHost }}
+              details: "$(YAML_VALIDATION_ERRORS)"

@@ -1,0 +1,176 @@
+# New Relic Workflow Automation — NPM Container Management
+#
+# Triggers the Azure DevOps manage-container pipeline via a 2-step approach:
+#   Step 1 (getAzureToken):  Obtains an OAuth2 bearer token from Azure AD via a
+#     client_credentials grant scoped to Azure DevOps (resource ID 499b84ac-1321-427f-aa17-267ca6975798).
+#   Step 2 (triggerPipeline): Calls the Azure DevOps Pipelines REST API via http.post,
+#     passing the bearer token in the Authorization header.
+
+# Prerequisites:
+#   1. Azure AD service principal registered and authorized in your Azure DevOps organization
+#      (see README Step 9 for setup instructions)
+#   2. The following secrets stored in New Relic Workflow Automation Secrets Manager:
+#        azure-client-id       — Service principal Application (client) ID
+#        azure-client-secret   — Service principal client secret value
+#   3. The following defaultValues are required to connect to your Azure DevOps environment:
+#        azureTenantId, azureDevOpsOrg, azureDevOpsProject, pipelineId
+#
+# Trigger options:
+#   - Manual: From the Workflow Automation UI, click the workflow → "Run" and supply inputs
+#   - Scheduled: Add a cron schedule in the workflow configuration
+#   - **ROADMAP: Trigger via New Relic App UI**
+#
+# Reference:
+#   http.post action docs:       https://docs.newrelic.com/docs/workflow-automation/setup-and-configure/actions-catalog/http/http-post/
+#   Azure DevOps Pipelines API:  https://learn.microsoft.com/en-us/rest/api/azure/devops/pipelines/runs/run-pipeline
+#   Workflow Automation docs:    https://docs.newrelic.com/docs/workflow-automation/introduction-to-workflow/
+
+name: npm-manage-container
+workflowInputs:
+
+  # ─────────────────────────────────────────────────────────
+  # Azure AD Service Principal credentials (stored as NR secrets)
+  # These default to secret references — no changes needed if you
+  # named your secrets azure-client-id, azure-client-secret.
+  # ─────────────────────────────────────────────────────────
+  azureClientId:
+    type: String
+    defaultValue: "${{ :secrets:azure:azure-client-id }}"
+    required: true
+  azureClientSecret:
+    type: String
+    defaultValue: "${{ :secrets:azure:azure-client-secret }}"
+    required: true
+
+  # ─────────────────────────────────────────────────────────
+  # Azure DevOps organization identifiers — UPDATE THESE DEFAULTS
+  # ─────────────────────────────────────────────────────────
+  azureTenantId:
+    type: String
+    defaultValue: "your-tenant-id"   # Replace with your Azure AD tenant ID (GUID)
+    required: true
+  azureDevOpsOrg:
+    type: String
+    defaultValue: "your-org"         # Replace with your Azure DevOps organization name
+    required: true
+  azureDevOpsProject:
+    type: String
+    defaultValue: "your-project"     # Replace with your Azure DevOps project name
+    required: true
+  pipelineId:
+    type: Int
+    defaultValue: 0                  # Replace with your pipeline ID (from the pipeline URL: ?definitionId=N)
+    required: true
+
+  # ─────────────────────────────────────────────────────────
+  # NPM container pipeline parameters
+  # These map directly to the manage-container.yml pipeline parameters.
+  # ─────────────────────────────────────────────────────────
+  containerAction:
+    type: Enum
+    required: true
+    enumValues:
+      - create
+      - add-devices
+      - update-devices
+      - remove-devices
+      - start
+      - stop
+      - remove
+    defaultValue: create              # One of: create, add-devices, update-devices, remove-devices, start, stop, remove
+  containerID:
+    type: String                     # Required — unique container identifier (e.g., npm-dc01-01)
+    required: true
+    validations:
+      - type: regex
+        errorMessage: "containerID must be lowercase alphanumeric with hyphens, min 2 chars (e.g., npm-dc01-01)"
+        pattern: "^[a-z0-9][a-z0-9-]*[a-z0-9]$"
+      - type: maxLength
+        errorMessage: "containerID must be 63 characters or fewer"
+        length: 63
+  targetHost:
+    type: String                     # Required — Azure DevOps SSH service connection name (e.g., ssh-dc01)
+    required: true
+    validations:
+      - type: regex
+        errorMessage: "targetHost must contain only alphanumeric characters, hyphens, and underscores (e.g., ssh-dc01)"
+        pattern: "^[a-zA-Z0-9][a-zA-Z0-9_-]*$"
+      - type: maxLength
+        errorMessage: "targetHost must be 128 characters or fewer"
+        length: 128
+  devices:
+    type: List
+    defaultValue: []               # JSON array of device objects (required for create, add-devices, and update-devices)
+    validations:
+      - type: maxLength
+        errorMessage: "devices payload must be < 500 devices"
+        length: 500
+  removeDevices:
+    type: List
+    defaultValue: []               # JSON array of device objects to remove, matched by device_ip (required for remove-devices)
+    validations:
+      - type: maxLength
+        errorMessage: "removeDevices payload must be < 500 devices"
+        length: 500
+  snmpCommunity:
+    type: String
+    defaultValue: "public"
+  probeDevices:
+    type: Boolean
+    defaultValue: false          # Set to true to auto-detect device vendor profiles via SNMP (opt-in for create/add-devices only)
+  force:
+    type: Boolean
+    defaultValue: false            # Set to true to allow create to overwrite an existing container
+
+steps:
+  # Step 1: Obtain an OAuth2 bearer token from Azure AD for Azure DevOps
+  # Uses the client_credentials grant with the Azure DevOps resource scope.
+  - name: getAzureToken
+    type: action
+    action: http.post
+    version: 1
+    inputs:
+      url: "https://login.microsoftonline.com/${{ .workflowInputs.azureTenantId }}/oauth2/v2.0/token"
+      headers: '{"Content-Type": "application/x-www-form-urlencoded"}'
+      body: "client_id=${{ .workflowInputs.azureClientId }}&client_secret=${{ .workflowInputs.azureClientSecret }}&scope=499b84ac-1321-427f-aa17-267ca6975798%2F.default&grant_type=client_credentials"
+      selectors:
+        - name: accessToken
+          expression: ".responseBody | fromjson | .access_token"
+        - name: statusCode
+          expression: ".statusCode | tostring"
+    next: triggerPipeline
+
+  # Step 2: Trigger the Azure DevOps pipeline via the Azure DevOps REST API
+  - name: triggerPipeline
+    type: action
+    action: http.post
+    version: 1
+    inputs:
+      url: "https://dev.azure.com/${{ .workflowInputs.azureDevOpsOrg }}/${{ .workflowInputs.azureDevOpsProject }}/_apis/pipelines/${{ .workflowInputs.pipelineId }}/runs?api-version=7.1"
+      headers: '{"Authorization": "Bearer ${{ .steps.getAzureToken.outputs.accessToken }}", "Content-Type": "application/json"}'
+      body: '{"resources":{"repositories":{"self":{"refName":"refs/heads/main"}}},"templateParameters":{"containerAction":"${{ .workflowInputs.containerAction }}","containerID":"${{ .workflowInputs.containerID }}","targetHost":"${{ .workflowInputs.targetHost }}","devices":${{ .workflowInputs.devices | tojson | tojson }},"removeDevices":${{ .workflowInputs.removeDevices | tojson | tojson }},"snmpCommunity":"${{ .workflowInputs.snmpCommunity }}","probeDevices":"${{ .workflowInputs.probeDevices }}","force":"${{ .workflowInputs.force }}"}}'
+      selectors:
+        - name: pipelineRunId
+          expression: ".responseBody | fromjson | .id | tostring"
+        - name: pipelineRunUrl
+          expression: ".responseBody | fromjson | ._links.web.href"
+        - name: statusCode
+          expression: ".statusCode | tostring"
+    next: logTriggerResult
+
+  # Step 3: Log the trigger result to New Relic
+  - name: logTriggerResult
+    type: action
+    action: newrelic.ingest.sendLogs
+    version: 1
+    inputs:
+      logs:
+        - message: "NPM Container Pipeline Triggered"
+          attributes:
+            containerAction: ${{ .workflowInputs.containerAction }}
+            containerID: ${{ .workflowInputs.containerID }}
+            targetHost: ${{ .workflowInputs.targetHost }}
+            tokenStatusCode: ${{ .steps.getAzureToken.outputs.statusCode // "N/A" }}
+            pipelineStatusCode: ${{ .steps.triggerPipeline.outputs.statusCode // "N/A" }}
+            pipelineRunId: ${{ .steps.triggerPipeline.outputs.pipelineRunId // "N/A" }}
+            pipelineRunUrl: ${{ .steps.triggerPipeline.outputs.pipelineRunUrl // "N/A" }}

@@ -1,0 +1,71 @@
+# Action template: start
+# Stage: Deploy (start)
+#
+# Starts a previously stopped container by restarting the preserved Docker container
+# using the existing config files already on the host. No config regeneration or
+# container recreation is performed.
+#
+# Requirements: the container must have been created previously and stopped via the
+# 'stop' action. The stopped container must still exist, and all config files
+# (snmp-base.yaml, devices.yaml, docker-compose.yml, .env) must be present in
+# /etc/ktranslate/{containerID}/ on the target host.
+#
+# Called from pipelines/manage-container.yml when action == 'start'.
+
+parameters:
+  - name: containerID
+    type: string
+  - name: targetHost
+    type: string
+
+stages:
+
+  # ============================================================
+  # Stage: Deploy
+  # Copies management scripts to host, starts the preserved stopped container,
+  # then runs a health check to confirm it is polling correctly.
+  # ============================================================
+  - stage: Deploy
+    displayName: "Deploy: start ${{ parameters.containerID }}"
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - job: DeployAction
+        displayName: "Start container"
+        timeoutInMinutes: 10
+        steps:
+          - checkout: self
+
+          - template: ../templates/steps/copy-scripts-to-host.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+
+          - task: SSH@0
+            displayName: "Execute: start ${{ parameters.containerID }}"
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              runOptions: inline
+              failOnStdErr: false
+              inline: |
+                chmod +x /etc/ktranslate/scripts/manage-container.sh
+                /etc/ktranslate/scripts/manage-container.sh \
+                  --action start \
+                  --container-id "${{ parameters.containerID }}"
+
+          - task: SSH@0
+            displayName: "Health check: ${{ parameters.containerID }}"
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              runOptions: inline
+              inline: |
+                CONTAINER_NAME="ktranslate-${{ parameters.containerID }}"
+                chmod +x /etc/ktranslate/scripts/healthcheck.sh
+                /etc/ktranslate/scripts/healthcheck.sh "$CONTAINER_NAME"
+
+          - template: ../templates/steps/publish-result-to-nr.yml
+            parameters:
+              action: start
+              containerID: ${{ parameters.containerID }}
+              targetHost: ${{ parameters.targetHost }}
+
+              details: "Container start"

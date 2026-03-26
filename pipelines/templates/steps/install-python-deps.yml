@@ -1,0 +1,10 @@
+# Step template: install-python-deps
+# Installs Python dependencies required by pipeline Python scripts.
+# Must run before any PythonScript@0 task that imports pyyaml.
+#
+# Reusable across all action templates to ensure a consistent Python environment.
+
+steps:
+  - bash: |
+      pip install pyyaml
+    displayName: "Install Python dependencies (pyyaml)"

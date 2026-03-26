@@ -1,0 +1,26 @@
+# Step template: copy-scripts-to-host
+# Copies manage-container.sh and healthcheck.sh from the repo to /etc/ktranslate/scripts/
+# on the target host so subsequent SSH tasks can execute them.
+#
+# Parameters:
+#   sshEndpoint  — Azure DevOps SSH service connection name
+#   sourceFolder — path containing the scripts (defaults to $(Build.SourcesDirectory)/scripts)
+
+parameters:
+  - name: sshEndpoint
+    type: string
+  - name: sourceFolder
+    type: string
+    default: $(Build.SourcesDirectory)/scripts
+
+steps:
+  - task: CopyFilesOverSSH@0
+    displayName: "Copy management scripts to host"
+    inputs:
+      sshEndpoint: ${{ parameters.sshEndpoint }}
+      sourceFolder: ${{ parameters.sourceFolder }}
+      contents: |
+        manage-container.sh
+        healthcheck.sh
+      targetFolder: /etc/ktranslate/scripts/
+      readyTimeout: '20000'

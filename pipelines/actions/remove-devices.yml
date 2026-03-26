@@ -1,0 +1,93 @@
+# Action template: remove-devices
+# Stage: RemoveDevices
+#
+# Removes specified devices from an existing container's devices.yaml by device_ip,
+# then restarts the polling container to pick up the updated inventory.
+#
+# Called from pipelines/manage-container.yml when action == 'remove-devices'.
+
+parameters:
+  - name: containerID
+    type: string
+  - name: targetHost
+    type: string
+  - name: removeDevices
+    type: string
+
+stages:
+
+  # ============================================================
+  # Stage: RemoveDevices
+  # Fetch devices.yaml from host, remove by IP, upload updated config, restart.
+  # ============================================================
+  - stage: RemoveDevices
+    displayName: "Remove devices from ${{ parameters.containerID }}"
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - job: RemoveDevicesJob
+        displayName: "Fetch, remove, upload devices"
+        timeoutInMinutes: 10
+        steps:
+          - checkout: self
+
+          - template: ../templates/steps/install-python-deps.yml
+
+          - template: ../templates/steps/fetch-devices-b64.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+              containerID: ${{ parameters.containerID }}
+
+          # Validate the fetched devices.yaml from the host before using it as merge input.
+          # If the host config is corrupted this halts the pipeline before any changes are made.
+          - template: ../templates/steps/validate-fetched-devices.yml
+            parameters:
+              devicesB64Var: $(fetchDevices.currentDevicesB64)
+
+          - task: PythonScript@0
+            inputs:
+              scriptSource: filePath
+              scriptPath: $(Build.SourcesDirectory)/scripts/manage_devices.py
+              arguments: >-
+                --action remove
+                --container-id "${{ parameters.containerID }}"
+                --output-dir "$(Build.ArtifactStagingDirectory)/updated-config"
+            displayName: "Remove devices by IP"
+            env:
+              EXISTING_DEVICES_B64: $(fetchDevices.currentDevicesB64)
+              REMOVE_DEVICES_JSON:  '${{ parameters.removeDevices }}'
+
+          # Validate generated devices.yaml and snmp-base.yaml BEFORE touching the host.
+          # If validation fails: backup is skipped (preserving last good backup), upload is
+          # skipped (host config unchanged), restart is skipped (container keeps running).
+          - template: ../templates/steps/validate-config.yml
+            parameters:
+              sourceFolder: $(Build.ArtifactStagingDirectory)/updated-config
+
+          - template: ../templates/steps/backup-config.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+              containerID: ${{ parameters.containerID }}
+
+          - template: ../templates/steps/upload-config.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+              containerID: ${{ parameters.containerID }}
+              sourceFolder: $(Build.ArtifactStagingDirectory)/updated-config
+
+          - template: ../templates/steps/copy-scripts-to-host.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+
+          - template: ../templates/steps/restart-and-healthcheck.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+              containerID: ${{ parameters.containerID }}
+
+          - template: ../templates/steps/publish-result-to-nr.yml
+            parameters:
+              action: remove-devices
+              containerID: ${{ parameters.containerID }}
+              targetHost: ${{ parameters.targetHost }}
+
+              details: "$(YAML_VALIDATION_ERRORS)"

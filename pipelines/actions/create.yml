@@ -1,0 +1,326 @@
+# Action template: create
+# Stages: GenerateConfig → ProbeDevices (opt-in) → Deploy
+#
+# Handles the full lifecycle for spinning up a new ktranslate container:
+#   1. GenerateConfig  — generate snmp-base.yaml, devices.yaml, docker-compose.yml on runner
+#   2. ProbeDevices    — (opt-in) fingerprint devices via temp ktranslate container; enrich config
+#   3. Deploy          — copy config + scripts to host, run manage-container.sh --action create,
+#                        verify container health
+#
+# Called from pipelines/manage-container.yml when action == 'create'.
+
+parameters:
+  - name: containerID
+    type: string
+  - name: targetHost
+    type: string
+  - name: devices
+    type: string
+  - name: snmpCommunity
+    type: string
+  - name: probeDevices
+    type: boolean
+  - name: force
+    type: boolean
+
+stages:
+
+  # ============================================================
+  # Stage: GenerateConfig
+  # Generates snmp-base.yaml (with @devices.yaml include) + devices.yaml + docker-compose.yml
+  # ============================================================
+  - stage: GenerateConfig
+    displayName: "Generate config"
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - job: GenerateYAML
+        displayName: "Generate snmp-base.yaml + devices.yaml"
+        steps:
+          - checkout: self
+
+          - template: ../templates/steps/install-python-deps.yml
+
+          - bash: mkdir -p $(Build.ArtifactStagingDirectory)/config
+            displayName: "Create config output directory"
+
+          - task: PythonScript@0
+            inputs:
+              scriptSource: filePath
+              scriptPath: $(Build.SourcesDirectory)/scripts/generate_config.py
+              arguments: >-
+                --container-id "${{ parameters.containerID }}"
+                --output-dir "$(Build.ArtifactStagingDirectory)/config"
+            displayName: "Generate snmp-base.yaml and devices.yaml"
+            env:
+              DEVICES_JSON:   ${{ parameters.devices }}
+              SNMP_COMMUNITY: ${{ parameters.snmpCommunity }}
+
+          - task: PythonScript@0
+            inputs:
+              scriptSource: filePath
+              scriptPath: $(Build.SourcesDirectory)/scripts/render_template.py
+              arguments: >-
+                --template templates/docker-compose.template.yml
+                --output "$(Build.ArtifactStagingDirectory)/config/docker-compose.yml"
+                --set CONTAINER_ID=${{ parameters.containerID }}
+            displayName: "Generate docker-compose.yml"
+
+          # Validate devices.yaml and snmp-base.yaml before publishing the config artifact.
+          # A malformed config here will never reach the host or be used in probe stages.
+          - template: ../templates/steps/validate-config.yml
+            parameters:
+              sourceFolder: $(Build.ArtifactStagingDirectory)/config
+
+          - publish: $(Build.ArtifactStagingDirectory)/config
+            artifact: container-config
+            displayName: "Publish config artifact"
+
+  # ============================================================
+  # Stage: ProbeDevices (opt-in)
+  # Runs a temporary ktranslate container on the host to fingerprint devices.
+  # Enriches devices.yaml with oid, mib_profile, provider, discovered_mibs.
+  # No Python, pyyaml, or jq required on the target host.
+  # ============================================================
+  - stage: ProbeDevices
+    displayName: "Probe devices (opt-in)"
+    dependsOn:
+      - Validate
+      - GenerateConfig
+    condition: |
+      and(
+        succeeded(),
+        eq('${{ parameters.probeDevices }}', 'true')
+      )
+    jobs:
+      - job: RunProbe
+        displayName: "Run device probe"
+        timeoutInMinutes: 15
+        steps:
+          - checkout: self
+
+          - download: current
+            artifact: container-config
+            displayName: "Download config artifact"
+
+          # Step 1: Generate probe YAML on runner
+          - template: ../templates/steps/install-python-deps.yml
+
+          - task: PythonScript@0
+            inputs:
+              scriptSource: filePath
+              scriptPath: $(Build.SourcesDirectory)/scripts/generate_probe_config.py
+              arguments: >-
+                --output "$(Build.ArtifactStagingDirectory)/probe/snmp-probe.yaml"
+            displayName: "Generate probe config on runner"
+            env:
+              DEVICES_JSON:   ${{ parameters.devices }}
+              SNMP_COMMUNITY: ${{ parameters.snmpCommunity }}
+
+          # Step 2: Copy probe YAML + run-probe.sh to host
+          - task: CopyFilesOverSSH@0
+            displayName: "Copy probe config to host"
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              sourceFolder: $(Build.ArtifactStagingDirectory)/probe
+              contents: snmp-probe.yaml
+              targetFolder: /etc/ktranslate/probe-${{ parameters.containerID }}/
+              readyTimeout: '20000'
+
+          - task: CopyFilesOverSSH@0
+            displayName: "Copy run-probe.sh to host"
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              sourceFolder: $(Build.SourcesDirectory)/scripts
+              contents: run-probe.sh
+              targetFolder: /etc/ktranslate/scripts/
+              readyTimeout: '20000'
+
+          # Step 3: Run probe on host (docker run --rm with -snmp_out_file)
+          - task: SSH@0
+            displayName: "Run ktranslate discovery probe on host"
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              runOptions: inline
+              failOnStdErr: false
+              inline: |
+                chmod +x /etc/ktranslate/scripts/run-probe.sh
+                /etc/ktranslate/scripts/run-probe.sh \
+                  --container-id "${{ parameters.containerID }}"
+
+          # Step 4: Retrieve discovered-snmp.yaml from host as base64; clean up probe dir
+          - task: SSH@0
+            displayName: "Return discovery output to runner"
+            name: getDiscoveryOutput
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              runOptions: inline
+              inline: |
+                YAML_B64=$(base64 -w 0 /etc/ktranslate/probe-${{ parameters.containerID }}/discovered-snmp.yaml)
+                echo "##vso[task.setvariable variable=discoveredYamlB64;isOutput=true]$YAML_B64"
+                rm -rf /etc/ktranslate/probe-${{ parameters.containerID }}
+
+          # Step 5: Decode discovery output on runner, merge enriched fields into devices JSON,
+          # then produce updated snmp-base.yaml + devices.yaml in the config artifact.
+          - bash: |
+              echo "$(getDiscoveryOutput.discoveredYamlB64)" | base64 -d \
+                > "$(Build.ArtifactStagingDirectory)/probe/discovered-snmp.yaml"
+            displayName: "Decode discovery output"
+
+          - task: PythonScript@0
+            inputs:
+              scriptSource: filePath
+              scriptPath: $(Build.SourcesDirectory)/scripts/merge_probe_results.py
+              arguments: >-
+                --container-id "${{ parameters.containerID }}"
+                --probe-yaml-path "$(Build.ArtifactStagingDirectory)/probe/discovered-snmp.yaml"
+                --output-dir "$(Pipeline.Workspace)/container-config"
+                --output-mode config
+            displayName: "Merge probe results and regenerate config on runner"
+            env:
+              DEVICES_JSON:    '${{ parameters.devices }}'
+              SNMP_COMMUNITY:  '${{ parameters.snmpCommunity }}'
+
+          # Validate the enriched config before re-publishing — ensures probe-merged YAML
+          # is structurally correct before it can be deployed to the host.
+          - template: ../templates/steps/validate-config.yml
+            parameters:
+              sourceFolder: $(Pipeline.Workspace)/container-config
+
+          - publish: $(Pipeline.Workspace)/container-config
+            artifact: container-config-enriched
+            displayName: "Publish enriched config artifact"
+
+  # ============================================================
+  # Stage: Deploy
+  # Copies config + scripts to host, runs manage-container.sh create, health check.
+  # ============================================================
+  - stage: Deploy
+    displayName: "Deploy: create ${{ parameters.containerID }}"
+    dependsOn:
+      - Validate
+      - GenerateConfig
+      - ProbeDevices
+    condition: |
+      and(
+        eq(dependencies.Validate.result, 'Succeeded'),
+        eq(dependencies.GenerateConfig.result, 'Succeeded'),
+        in(dependencies.ProbeDevices.result, 'Succeeded', 'Skipped')
+      )
+    jobs:
+      - job: DeployAction
+        displayName: "Create container"
+        timeoutInMinutes: 10
+        steps:
+          - checkout: self
+
+          - template: ../templates/steps/install-python-deps.yml
+
+          - ${{ if eq(parameters.probeDevices, true) }}:
+            - download: current
+              artifact: container-config-enriched
+              displayName: "Download enriched config artifact"
+
+          - ${{ if ne(parameters.probeDevices, true) }}:
+            - download: current
+              artifact: container-config
+              displayName: "Download config artifact"
+
+          - bash: |
+              if [ "${{ parameters.probeDevices }}" = "True" ] || [ "${{ parameters.probeDevices }}" = "true" ]; then
+                echo "##vso[task.setvariable variable=CONFIG_ARTIFACT_DIR]$(Pipeline.Workspace)/container-config-enriched"
+              else
+                echo "##vso[task.setvariable variable=CONFIG_ARTIFACT_DIR]$(Pipeline.Workspace)/container-config"
+              fi
+            displayName: "Resolve config artifact directory"
+
+          # Belt-and-suspenders validation of the artifact before anything is sent to the host.
+          # Catches any corruption that may have occurred during artifact transfer.
+          - template: ../templates/steps/validate-config.yml
+            parameters:
+              sourceFolder: $(CONFIG_ARTIFACT_DIR)
+
+          # Pre-flight check: fail if container already exists (unless force=true)
+          - task: SSH@0
+            displayName: "Check for existing container"
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              runOptions: inline
+              inline: |
+                CONFIG_DIR="/etc/ktranslate/${{ parameters.containerID }}"
+                FORCE="${{ parameters.force }}"
+
+                if [ -d "$CONFIG_DIR" ]; then
+                  if [ "$FORCE" = "True" ] || [ "$FORCE" = "true" ]; then
+                    echo "WARNING: Container ${{ parameters.containerID }} already exists on this host."
+                    echo "force=true — backing up existing config before overwriting."
+                    TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
+                    for f in devices.yaml snmp-base.yaml docker-compose.yml; do
+                      if [ -f "$CONFIG_DIR/$f" ]; then
+                        cp "$CONFIG_DIR/$f" "$CONFIG_DIR/${f}.bak.${TIMESTAMP}"
+                        echo "  Backed up: $f → ${f}.bak.${TIMESTAMP}"
+                      fi
+                    done
+                  else
+                    echo "##############################################################"
+                    echo "ERROR: Container ${{ parameters.containerID }} already exists on this host."
+                    echo ""
+                    echo "  Config directory found: $CONFIG_DIR"
+                    echo ""
+                    echo "  To modify devices, use action: add-devices or remove-devices."
+                    echo "  To replace the container, use action: remove first, then create."
+                    echo "  To force overwrite (with backup), set force=true."
+                    echo "##############################################################"
+                    exit 1
+                  fi
+                else
+                  echo "No existing container found. Proceeding with create."
+                fi
+
+          - task: CopyFilesOverSSH@0
+            displayName: "Copy config files to host"
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              sourceFolder: $(CONFIG_ARTIFACT_DIR)
+              contents: |
+                snmp-base.yaml
+                devices.yaml
+                docker-compose.yml
+              targetFolder: /etc/ktranslate/${{ parameters.containerID }}/
+              readyTimeout: '20000'
+
+          - template: ../templates/steps/copy-scripts-to-host.yml
+            parameters:
+              sshEndpoint: ${{ parameters.targetHost }}
+
+          - task: SSH@0
+            displayName: "Execute: create ${{ parameters.containerID }}"
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              runOptions: inline
+              failOnStdErr: false
+              inline: |
+                export NR_INGEST_KEY="$(NR_INGEST_KEY)"
+                export NR_ACCOUNT_ID="$(NR_ACCOUNT_ID)"
+                chmod +x /etc/ktranslate/scripts/manage-container.sh
+                /etc/ktranslate/scripts/manage-container.sh \
+                  --action create \
+                  --container-id "${{ parameters.containerID }}"
+
+          - task: SSH@0
+            displayName: "Health check: ${{ parameters.containerID }}"
+            inputs:
+              sshEndpoint: ${{ parameters.targetHost }}
+              runOptions: inline
+              inline: |
+                chmod +x /etc/ktranslate/scripts/healthcheck.sh
+                CONTAINER_NAME="ktranslate-${{ parameters.containerID }}"
+                /etc/ktranslate/scripts/healthcheck.sh "$CONTAINER_NAME"
+
+          - template: ../templates/steps/publish-result-to-nr.yml
+            parameters:
+              action: create
+              containerID: ${{ parameters.containerID }}
+              targetHost: ${{ parameters.targetHost }}
+
+              details: "$(YAML_VALIDATION_ERRORS)"

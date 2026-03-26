@@ -1,0 +1,37 @@
+﻿# New Relic NPM - Docker Compose Template
+# Used by the CI/CD pipeline to generate per-container docker-compose files.
+#
+# The pipeline replaces {{CONTAINER_ID}} with the unique container identifier.
+# Credentials are loaded from .env (written by manage-container.sh during create).
+# The .env file persists on the host so restarts don't need credentials re-exported.
+#
+# Config split:
+#   snmp-base.yaml  — Stable global config, references devices.yaml via @-include.
+#   devices.yaml    — Mutable device inventory, managed by add-devices/remove-devices.
+# Both files are mounted into the container root so the @-include resolves correctly.
+#
+# Reference docs:
+#   https://docs.newrelic.com/docs/network-performance-monitoring/setup-performance-monitoring/snmp-performance-monitoring/
+#   https://github.com/kentik/ktranslate
+
+services:
+  ktranslate-snmp:
+    image: kentik/ktranslate:v2
+    container_name: ktranslate-{{CONTAINER_ID}}
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - /etc/ktranslate/{{CONTAINER_ID}}/.env
+    environment:
+      - NEW_RELIC_API_KEY=${NR_INGEST_KEY}
+    volumes:
+      - /etc/ktranslate/{{CONTAINER_ID}}/snmp-base.yaml:/snmp-base.yaml:ro
+      - /etc/ktranslate/{{CONTAINER_ID}}/devices.yaml:/devices.yaml:ro
+    command:
+      - -snmp
+      - /snmp-base.yaml
+      - -nr_account_id=${NR_ACCOUNT_ID}
+      - -metrics=jchf
+      - -tee_logs=true
+      - -service_name={{CONTAINER_ID}}
+      - nr1.snmp

@@ -1,0 +1,39 @@
+# Secrets and environment files
+.env
+.env.*
+*.key
+*.pem
+credentials.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Backup files
+*.bak
+*.tmp
+
+# Temp docs
+docs/ktranslate*
+
+# Temp plans
+.github/prompts/*
+
+# Python cache and virtual environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Temp directories
+/tmp
+/tasks

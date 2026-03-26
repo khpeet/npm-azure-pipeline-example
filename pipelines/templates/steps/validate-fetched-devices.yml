@@ -1,0 +1,29 @@
+# Step template: validate-fetched-devices
+# Validates the base64-decoded devices.yaml fetched from the target host BEFORE
+# it is used as input for add/remove merge operations.
+#
+# If the fetched YAML is syntactically or structurally invalid, the pipeline halts
+# immediately — no merge, no backup, no upload, no container restart occurs.
+# This protects against host-side corruption propagating into a new broken config.
+#
+# The validation error (if any) is stored in the pipeline variable
+# YAML_VALIDATION_ERRORS so publish-result-to-nr.yml can forward it to New Relic.
+#
+# Parameters:
+#   devicesB64Var — runtime variable reference for the base64-encoded devices.yaml,
+#                   e.g. $(fetchDevices.currentDevicesB64). Passed via env so that
+#                   the ADO agent expands the $(variable) macro at runtime before
+#                   the bash script executes.
+
+parameters:
+  - name: devicesB64Var
+    type: string
+
+steps:
+  - task: PythonScript@0
+    inputs:
+      scriptSource: filePath
+      scriptPath: $(Build.SourcesDirectory)/scripts/validate_fetched_devices.py
+    displayName: "Validate fetched devices.yaml from host"
+    env:
+      DEVICES_B64_VALUE: ${{ parameters.devicesB64Var }}

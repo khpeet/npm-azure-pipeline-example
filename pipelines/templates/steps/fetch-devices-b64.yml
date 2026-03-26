@@ -1,0 +1,37 @@
+# Step template: fetch-devices-b64
+# Fetches devices.yaml from the target host as a base64-encoded output variable.
+# The calling job can then decode it on the runner for processing.
+#
+# Parameters:
+#   sshEndpoint — Azure DevOps SSH service connection name
+#   containerID — unique container identifier; file is at /etc/ktranslate/{containerID}/devices.yaml
+#   stepName    — name given to this step (used to reference the output variable in the same job,
+#                 e.g. steps.<stepName>.outputs['currentDevicesB64'])
+#
+# Output variable:
+#   currentDevicesB64 — base64-encoded content of devices.yaml
+
+parameters:
+  - name: sshEndpoint
+    type: string
+  - name: containerID
+    type: string
+  - name: stepName
+    type: string
+    default: fetchDevices
+
+steps:
+  - task: SSH@0
+    displayName: "Fetch current devices.yaml from host"
+    name: ${{ parameters.stepName }}
+    inputs:
+      sshEndpoint: ${{ parameters.sshEndpoint }}
+      runOptions: inline
+      inline: |
+        if [ ! -f "/etc/ktranslate/${{ parameters.containerID }}/devices.yaml" ]; then
+          echo "ERROR: devices.yaml not found at /etc/ktranslate/${{ parameters.containerID }}/devices.yaml"
+          echo "Has this container been created? Run action=create first."
+          exit 1
+        fi
+        DEVICES_B64=$(base64 -w 0 /etc/ktranslate/${{ parameters.containerID }}/devices.yaml)
+        echo "##vso[task.setvariable variable=currentDevicesB64;isOutput=true]$DEVICES_B64"

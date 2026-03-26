@@ -1,0 +1,36 @@
+# Step template: restart-and-healthcheck
+# Restarts the polling container via manage-container.sh and then verifies it is healthy
+# via healthcheck.sh. Used after any config change (add-devices, remove-devices).
+#
+# Parameters:
+#   sshEndpoint — Azure DevOps SSH service connection name
+#   containerID — unique container identifier
+
+parameters:
+  - name: sshEndpoint
+    type: string
+  - name: containerID
+    type: string
+
+steps:
+  - task: SSH@0
+    displayName: "Restart polling container"
+    inputs:
+      sshEndpoint: ${{ parameters.sshEndpoint }}
+      runOptions: inline
+      failOnStdErr: false
+      inline: |
+        chmod +x /etc/ktranslate/scripts/manage-container.sh
+        /etc/ktranslate/scripts/manage-container.sh \
+          --action restart \
+          --container-id "${{ parameters.containerID }}"
+
+  - task: SSH@0
+    displayName: "Health check: ${{ parameters.containerID }}"
+    inputs:
+      sshEndpoint: ${{ parameters.sshEndpoint }}
+      runOptions: inline
+      inline: |
+        chmod +x /etc/ktranslate/scripts/healthcheck.sh
+        CONTAINER_NAME="ktranslate-${{ parameters.containerID }}"
+        /etc/ktranslate/scripts/healthcheck.sh "$CONTAINER_NAME"

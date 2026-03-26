@@ -1,0 +1,26 @@
+# Step template: validate-config
+# Validates devices.yaml and snmp-base.yaml in a local directory on the pipeline runner.
+#
+# Runs BEFORE backup and upload steps so that a malformed config never reaches the host.
+# If validation fails the step exits non-zero, halting the pipeline at this point:
+#   - backup-config is never executed (preserving the most-recent good backup)
+#   - upload-config is never executed (host keeps its current valid config)
+#   - restart-and-healthcheck is never executed (container keeps running)
+#
+# On failure the validated errors are stored in the pipeline variable
+# YAML_VALIDATION_ERRORS so publish-result-to-nr.yml can forward them to New Relic.
+#
+# Parameters:
+#   sourceFolder — path to directory containing devices.yaml and snmp-base.yaml
+
+parameters:
+  - name: sourceFolder
+    type: string
+
+steps:
+  - task: PythonScript@0
+    inputs:
+      scriptSource: filePath
+      scriptPath: $(Build.SourcesDirectory)/scripts/validate_config.py
+      arguments: --dir "${{ parameters.sourceFolder }}"
+    displayName: "Validate generated YAML configs"

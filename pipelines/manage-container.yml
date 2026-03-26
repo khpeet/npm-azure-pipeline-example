@@ -1,0 +1,224 @@
+﻿# Manage Container Pipeline — Master router (stateless)
+#
+# Routes each action to its dedicated template in pipelines/actions/:
+#   create          → actions/create.yml        (GenerateConfig → ProbeDevices → Deploy)
+#   add-devices     → actions/add-devices.yml   (ProbeDevices → AddDevices)
+#   update-devices  → actions/update-devices.yml (UpdateDevices)
+#   remove-devices  → actions/remove-devices.yml (RemoveDevices)
+#   start           → actions/start.yml         (Deploy — reuses on-disk config)
+#   stop | remove   → actions/stop-remove.yml   (Deploy)
+#
+# Triggered via the Azure DevOps REST API (by NR Workflow Automation).
+#
+# Config model:
+#   snmp-base.yaml  — Stable global config; references devices via devices: "@devices.yaml"
+#   devices.yaml    — Mutable device inventory; accumulated incrementally across runs
+#
+# Trigger flow:
+#   New Relic Workflow Automation → Azure DevOps REST API → Pipeline
+#
+# API call example:
+#   POST https://dev.azure.com/{org}/{project}/_apis/pipelines/{pipelineId}/runs?api-version=7.1
+#   Body: { "templateParameters": { "containerAction": "create", "containerID": "npm-01", "targetHost": "ssh-dc01", ... } }
+
+trigger: none
+pr: none
+appendCommitMessageToRunName: false
+name: $(runTitle)
+
+parameters:
+  - name: containerAction
+    displayName: "Action to perform"
+    type: string
+    values:
+      - create
+      - add-devices
+      - update-devices
+      - remove-devices
+      - start
+      - stop
+      - remove
+
+  - name: containerID
+    displayName: "Unique container identifier (e.g., npm-datacenter-01)"
+    type: string
+    default: ""
+
+  - name: targetHost
+    displayName: "SSH service connection name (required for all actions)"
+    type: string
+    default: ""
+
+  - name: devices
+    displayName: "Devices JSON array — required for create/add-devices/update-devices"
+    type: string
+    default: "[]"
+
+  - name: removeDevices
+    displayName: "Devices JSON array to remove — required for remove-devices (matched by device_ip)"
+    type: string
+    default: "[]"
+
+  - name: snmpCommunity
+    displayName: "Default SNMP community string"
+    type: string
+    default: "public"
+
+  - name: probeDevices
+    displayName: "Auto-probe devices via temp ktranslate container (opt-in; requires SNMP reachability)"
+    type: boolean
+    default: false
+
+  - name: force
+    displayName: "Force create even if container already exists (overwrites existing config after backup)"
+    type: boolean
+    default: false
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: newrelic-npm-secrets
+  - name: runTitle
+    value: "${{ parameters.containerAction }} - ${{ parameters.containerID }}"
+
+stages:
+
+  # ============================================================
+  # Stage: Validate — runs for every action
+  # ============================================================
+  - stage: Validate
+    displayName: "Validate parameters"
+    jobs:
+      - job: ValidateParams
+        displayName: "Validate inputs"
+        steps:
+          - checkout: self
+
+          - bash: pip install pyyaml
+            displayName: "Install Python dependencies (pyyaml)"
+
+          - bash: |
+              echo "=== Parameter Validation ==="
+              echo "Action:          ${{ parameters.containerAction }}"
+              echo "Container ID:    ${{ parameters.containerID }}"
+              echo "Target Host:     ${{ parameters.targetHost }}"
+              echo "SNMP Community:  [REDACTED]"
+              echo "Probe Devices:   ${{ parameters.probeDevices }}"
+              echo "Force:           ${{ parameters.force }}"
+              echo ""
+
+              ERRORS=0
+
+              # Store containerID in a temp variable for length check:
+              # Direct ${#{{ parameters.containerID }}} expansion produces e.g. ${#npm-dc01}
+              # which is invalid bash when the value contains hyphens.
+              _CID="${{ parameters.containerID }}"
+
+              if [ -z "${{ parameters.containerID }}" ]; then
+                echo "ERROR: containerID is required for all actions."
+                ERRORS=$((ERRORS + 1))
+              elif ! echo "${{ parameters.containerID }}" | grep -qE '^[a-z0-9][a-z0-9-]*[a-z0-9]$'; then
+                echo "ERROR: containerID must be lowercase alphanumeric with hyphens, min 2 chars (e.g., npm-dc01-01)."
+                echo "       Got: '${{ parameters.containerID }}'"
+                ERRORS=$((ERRORS + 1))
+              elif [ ${#_CID} -gt 63 ]; then
+                echo "ERROR: containerID must be 63 characters or fewer."
+                ERRORS=$((ERRORS + 1))
+              fi
+
+              if [ -z "${{ parameters.targetHost }}" ]; then
+                echo "ERROR: targetHost is required for all actions."
+                ERRORS=$((ERRORS + 1))
+              elif ! echo "${{ parameters.targetHost }}" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9_-]*$'; then
+                echo "ERROR: targetHost must contain only alphanumeric characters, hyphens, and underscores."
+                echo "       Got: '${{ parameters.targetHost }}'"
+                ERRORS=$((ERRORS + 1))
+              fi
+
+              if [ $ERRORS -gt 0 ]; then
+                echo ""
+                echo "Parameter validation failed with $ERRORS error(s)."
+                exit 1
+              fi
+
+              echo ""
+              echo "Parameter validation passed."
+            displayName: "Validate parameters (containerID / targetHost)"
+
+          # Validate devices / removeDevices JSON arrays via Python
+          - task: PythonScript@0
+            inputs:
+              scriptSource: filePath
+              scriptPath: $(Build.SourcesDirectory)/scripts/validate_inputs.py
+              arguments: --action "${{ parameters.containerAction }}"
+            displayName: "Validate device input JSON"
+            env:
+              DEVICES_JSON:        ${{ parameters.devices }}
+              REMOVE_DEVICES_JSON: ${{ parameters.removeDevices }}
+              PROBE_DEVICES:       ${{ parameters.probeDevices }}
+
+  # ============================================================
+  # Route: create — GenerateConfig → ProbeDevices (opt-in) → Deploy
+  # ============================================================
+  - ${{ if eq(parameters.containerAction, 'create') }}:
+    - template: actions/create.yml
+      parameters:
+        containerID:   ${{ parameters.containerID }}
+        targetHost:    ${{ parameters.targetHost }}
+        devices:       ${{ parameters.devices }}
+        snmpCommunity: ${{ parameters.snmpCommunity }}
+        probeDevices:  ${{ parameters.probeDevices }}
+        force:         ${{ parameters.force }}
+
+  # ============================================================
+  # Route: add-devices — ProbeDevices (opt-in) → AddDevices
+  # ============================================================
+  - ${{ if eq(parameters.containerAction, 'add-devices') }}:
+    - template: actions/add-devices.yml
+      parameters:
+        containerID:   ${{ parameters.containerID }}
+        targetHost:    ${{ parameters.targetHost }}
+        devices:       ${{ parameters.devices }}
+        snmpCommunity: ${{ parameters.snmpCommunity }}
+        probeDevices:  ${{ parameters.probeDevices }}
+
+  # ============================================================
+  # Route: update-devices — UpdateDevices
+  # ============================================================
+  - ${{ if eq(parameters.containerAction, 'update-devices') }}:
+    - template: actions/update-devices.yml
+      parameters:
+        containerID:   ${{ parameters.containerID }}
+        targetHost:    ${{ parameters.targetHost }}
+        devices:       ${{ parameters.devices }}
+        snmpCommunity: ${{ parameters.snmpCommunity }}
+
+  # ============================================================
+  # Route: remove-devices — RemoveDevices
+  # ============================================================
+  - ${{ if eq(parameters.containerAction, 'remove-devices') }}:
+    - template: actions/remove-devices.yml
+      parameters:
+        containerID:   ${{ parameters.containerID }}
+        targetHost:    ${{ parameters.targetHost }}
+        removeDevices: ${{ parameters.removeDevices }}
+
+  # ============================================================
+  # Route: start — Deploy (no config generation; reuses on-disk config)
+  # ============================================================
+  - ${{ if eq(parameters.containerAction, 'start') }}:
+    - template: actions/start.yml
+      parameters:
+        containerID: ${{ parameters.containerID }}
+        targetHost:  ${{ parameters.targetHost }}
+
+  # ============================================================
+  # Route: stop | remove — Deploy (no config generation)
+  # ============================================================
+  - ${{ if or(eq(parameters.containerAction, 'stop'), eq(parameters.containerAction, 'remove')) }}:
+    - template: actions/stop-remove.yml
+      parameters:
+        action:      ${{ parameters.containerAction }}
+        containerID: ${{ parameters.containerID }}
+        targetHost:  ${{ parameters.targetHost }}
