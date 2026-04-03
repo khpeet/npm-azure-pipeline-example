@@ -25,6 +25,60 @@ Each pipeline run manages **one container** identified by a unique `containerID`
 
 ---
 
+## Table of Contents
+
+- [How It Works](#how-it-works)
+- [Prerequisites](#prerequisites)
+- [Setup Guide](#setup-guide)
+  - [Step 1: Create Azure DevOps Organization and Project](#step-1-create-azure-devops-organization-and-project)
+  - [Step 2: Import Code into Azure Repos](#step-2-import-code-into-azure-repos)
+  - [Step 3: Create the Pipeline](#step-3-create-the-pipeline)
+  - [Step 4: Get New Relic Credentials](#step-4-get-new-relic-credentials)
+  - [Step 5: Create Variable Group (Secrets)](#step-5-create-variable-group-secrets)
+  - [Step 6: Generate SSH Key Pair](#step-6-generate-ssh-key-pair)
+  - [Step 7: Create SSH Service Connection(s)](#step-7-create-ssh-service-connections)
+  - [Step 8: Prepare Linux Hosts](#step-8-prepare-linux-hosts)
+  - [Step 9: Register Azure AD Application (Service Principal)](#step-9-register-azure-ad-application-service-principal)
+  - [Step 10: Configure New Relic Workflow Automation](#step-10-configure-new-relic-workflow-automation)
+- [Usage Examples](#usage-examples)
+  - [Create a Container (Manual Device Profiles)](#create-a-container-manual-device-profiles)
+  - [Create a Container (Auto-Probe Devices)](#create-a-container-auto-probe-devices)
+  - [Add Devices to an Existing Container](#add-devices-to-an-existing-container)
+  - [Update Devices in an Existing Container](#update-devices-in-an-existing-container)
+  - [Change a Device IP (Supported Path)](#change-a-device-ip-supported-path)
+  - [Remove Devices from an Existing Container](#remove-devices-from-an-existing-container)
+  - [Stop a Container](#stop-a-container)
+  - [Remove a Container](#remove-a-container)
+  - [SNMPv3 Device Example](#snmpv3-device-example)
+- [Pipeline Actions Reference](#pipeline-actions-reference)
+  - [Universal: Validate (all actions)](#universal-validate-all-actions)
+  - [`create`](#create)
+  - [`add-devices`](#add-devices)
+  - [`update-devices`](#update-devices)
+  - [`remove-devices`](#remove-devices)
+  - [`start`](#start)
+  - [`stop`](#stop)
+  - [`remove`](#remove)
+  - [Shared Step Templates](#shared-step-templates)
+  - [Key Safety Invariants](#key-safety-invariants)
+- [Pipeline Parameters Reference](#pipeline-parameters-reference)
+  - [Device Object Fields](#device-object-fields)
+  - [`snmp_v3` object fields](#snmp_v3-object-fields)
+  - [`update-devices` payload rules](#update-devices-payload-rules)
+- [Troubleshooting](#troubleshooting)
+  - [Pipeline fails at Validate stage](#pipeline-fails-at-validate-stage)
+  - [SSH connection failures](#ssh-connection-failures)
+  - [Container fails health check](#container-fails-health-check)
+  - [Probe times out](#probe-times-out)
+  - [Pipeline runs but nothing happens in New Relic](#pipeline-runs-but-nothing-happens-in-new-relic)
+  - [Pipeline execution logging in New Relic](#pipeline-execution-logging-in-new-relic)
+  - [How to view pipeline run logs](#how-to-view-pipeline-run-logs)
+- [Architecture](#architecture)
+  - [File Structure](#file-structure)
+  - [Host File Layout](#host-file-layout)
+
+---
+
 ## Prerequisites
 
 Before starting, you need:
@@ -100,7 +154,7 @@ git push -u origin main
    - Name: `ktranslate-ingest-npm` (or your choice)
 4. Click **Create a key** again
    - Key type: **User**
-   - Name: `ktranslate-ingest-npm` (or your choice)
+   - Name: `ktranslate-user-npm` (or your choice)
 5. Copy these keys — the ingest key is your `NR_INGEST_KEY` and the User key will be used in [New Relic Secrets](#store-credentials-as-new-relic-secrets) section
 6. Copy the account id for the new row that was created in the table. This is the account your keys were created against and is your `NR_ACCOUNT_ID`
 
@@ -122,7 +176,7 @@ git push -u origin main
 
 > **Where to find these values:** See [Step 4: Get New Relic Credentials](#step-4-get-new-relic-credentials).
 
-### Step 5: Generate SSH Key Pair
+### Step 6: Generate SSH Key Pair
 
 On your local workstation, generate an SSH key pair that the pipeline will use to connect to your Linux hosts:
 
@@ -136,7 +190,7 @@ This creates:
 
 **Keep the private key secure.** You'll paste it into Azure DevOps in the next step.
 
-### Step 6: Create SSH Service Connection(s)
+### Step 7: Create SSH Service Connection(s)
 
 Create one SSH service connection per Linux host:
 
@@ -156,7 +210,7 @@ Create one SSH service connection per Linux host:
 
 Repeat for each Linux host you want to manage containers on.
 
-### Step 7: Prepare Linux Hosts
+### Step 8: Prepare Linux Hosts
 
 Run these commands on **each** Linux host that will run NPM containers:
 
@@ -191,7 +245,7 @@ sudo -u azpipeline docker run --rm hello-world
 
 > **Host prerequisites:** Docker and the `docker-compose` CLI. No Python or additional packages are needed on the host — all scripting logic runs on the Microsoft-hosted pipeline runner.
 
-### Step 8: Register Azure AD Application (Service Principal)
+### Step 9: Register Azure AD Application (Service Principal)
 
 New Relic Workflow Automation authenticates against the Azure DevOps REST API using an Azure AD service principal. This replaces the need for a Personal Access Token.
 
@@ -269,7 +323,7 @@ These are referenced in the workflow YAML as `${{ :secrets:azure:azure-client-id
 
 > NOTE: The only way to store credentials today is via API - a UI is coming soon. You can also programmatically create this outside of the graphql explorer via curl, or whatever request means you're comfortable with.
 
-### Step 9: Configure New Relic Workflow Automation
+### Step 10: Configure New Relic Workflow Automation
 
 New Relic Workflow Automation triggers the Azure DevOps pipeline with two `http.post` steps and then emits a trigger log to New Relic. A ready-to-use workflow template is included in this repo at [newrelic/newrelic-workflow.yml](newrelic/newrelic-workflow.yml).
 
@@ -305,6 +359,7 @@ The credential inputs (`azureClientId`, `azureClientSecret`) already default to 
 
 | Method | How |
 |--------|-----|
+| **UI** | Deploy [NPM Manager app](https://github.com/khpeet/nr1-npm-manager) |
 | **On-demand (manual)** | From the Workflow Automation UI, click the workflow → **Run** → supply `containerID`, `targetHost`, `containerAction`, and other inputs |
 | **Scheduled** | Add a cron schedule in the Workflow Automation configuration |
 
