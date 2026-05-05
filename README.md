@@ -181,7 +181,18 @@ You'll also need a Service Principal for this setup, so skip to [Step 9](#step-9
 
 2. Prepare a Linux runner machine for the agent.
   - Use a supported Linux distribution for Azure Pipelines agents. This project expects a Linux runner.
-  - Install the tools this pipeline uses on the runner (if the host doesn't already have them): `git`, `bash`, `python3`, `pip`, and GNU-compatible CLI tools such as `base64`.
+  - Install the tools this pipeline uses on the runner (if the host doesn't already have them): `git`, `bash`, `python3`, `pip`, and GNU-compatible CLI tools such as `base64`. For example:
+
+  ```bash
+  sudo dnf install -y git bash python3 python3-pip coreutils openssh-clients curl nmap-ncat
+  ```
+
+  - To validate these are available on `PATH`:
+
+  ```bash
+  command -v git bash python3 pip3 base64 ssh ssh-keyscan curl
+  ```
+
   - Ensure the runner has outbound access to Azure DevOps and Microsoft sign-in endpoints, as well as SSH access to the target Linux NPM hosts this pipeline will manage.
 
   > To ensure outbound access to Azure, run these curl commands on the agent host:
