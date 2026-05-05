@@ -74,8 +74,16 @@ parameters:
     type: boolean
     default: false
 
+# Default runner: Microsoft-hosted Ubuntu.
 pool:
   vmImage: 'ubuntu-latest'
+
+# To use a self-hosted Linux agent instead, replace above block with:
+# pool:
+#   name: your-self-hosted-pool
+#
+# If your pool contains mixed agents, add demands so the job lands on a Linux
+# runner with Python 3, pip, bash, and the GNU CLI behavior expected by the scripts.
 
 variables:
   - group: newrelic-npm-secrets

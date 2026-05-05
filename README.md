@@ -88,6 +88,7 @@ Before starting, you need:
 | **Azure account** | Free tier works. Sign up at [azure.microsoft.com](https://azure.microsoft.com/free/) |
 | **New Relic account** | With Network Performance Monitoring enabled. Sign up at [newrelic.com](https://newrelic.com/signup) |
 | **Linux host(s)** | Ubuntu 20.04+ or similar. Must have Docker/docker-compose installed and SSH access. Can be on-prem, cloud VM, or any Linux server reachable via SSH |
+| **Azure Pipelines runner** | Choose one: Microsoft-hosted Ubuntu agents using the default `pool` in `pipelines/manage-container.yml`, or a self-hosted Linux agent pool by replacing that `pool` block before running the pipeline |
 | **Workstation** | With `git` CLI installed (for initial repo setup only) |
 
 ---
@@ -143,6 +144,114 @@ git push -u origin main
    ```
    https://dev.azure.com/{org}/{project}/_build?definitionId=YOUR_PIPELINE_ID
    ```
+
+#### Runner Choice: Microsoft-hosted or Self-hosted
+
+The project defaults to **Microsoft-hosted Ubuntu** agents via the `pool` block in `pipelines/manage-container.yml`:
+
+```yaml
+pool:
+  vmImage: 'ubuntu-latest'
+```
+
+If you want to use a **self-hosted Linux** agent instead, edit that same file and replace the block with your pool name before running the pipeline:
+
+```yaml
+pool:
+  name: your-self-hosted-pool
+```
+
+If your self-hosted pool contains mixed agent types, add Azure Pipelines `demands` so jobs land only on a Linux runner with `bash`, `python3`, `pip`, and the GNU CLI behavior expected by these scripts.
+
+The New Relic workflow does not need different inputs for agent type. It always queues the same Azure DevOps pipeline, and that pipeline uses whichever `pool` is currently configured in `pipelines/manage-container.yml`.
+
+#### Self-hosted Agent Setup (Linux)
+
+If you do not already have a self-hosted agent pool, complete the minimum setup first below. Reference [Microsoft's docs here](https://learn.microsoft.com/en-us/azure/devops/pipelines/agents/linux-agent?view=azure-devops&tabs=IP-V4#check-prerequisites) for full pre-requisities, including supported OS distros, minimum user permissions, etc.
+
+You'll also need a Service Principal for this setup, so skip to [Step 9](#step-9-register-azure-ad-application-service-principal) to create that prior to following the following steps.
+
+1. Create or choose an Azure DevOps agent pool.
+  - In Azure DevOps, go to **Organization settings → Agent pools**
+  - Create a new pool or use the default `Default` self-hosted pool. 
+  
+  > **NOTE:** The user or service principal registering the agent must have **Administrator** rights on that pool. This can be configured under your **agent pool → Security → User permissions**
+  
+  - If your pool is locked down, make sure this pipeline is authorized to use it under **Agent pool → Security / Pipeline permissions**.
+
+2. Prepare a Linux runner machine for the agent.
+  - Use a supported Linux distribution for Azure Pipelines agents. This project expects a Linux runner.
+  - Install the tools this pipeline uses on the runner (if the host doesn't already have them): `git`, `bash`, `python3`, `pip`, and GNU-compatible CLI tools such as `base64`.
+  - Ensure the runner has outbound access to Azure DevOps and Microsoft sign-in endpoints, as well as SSH access to the target Linux NPM hosts this pipeline will manage.
+
+  > To ensure outbound access to Azure, run these curl commands on the agent host:
+
+  ```bash
+  curl -I https://dev.azure.com
+  curl -I https://vssps.dev.azure.com
+  curl -I https://login.microsoftonline.com
+  curl -I https://download.agent.dev.azure.com
+  ```
+
+  > To ensure ssh connectivity to target NPM hosts, validate you can `ssh` from the self-hosted agent machine to target NPM machines, or run:
+
+  ```bash
+  nc -vz <target-host-or-ip> 22
+  ```
+
+  if `nc` is unavailable, run:
+
+  ```bash
+  ssh-keyscan -T 5 <target-host-or-ip>
+  ```
+
+3. Download and register the Azure Pipelines agent on that machine.
+  - In **Agent pools**, open your pool, click **New agent**, choose **Linux**, and follow the generated install steps.
+  - On the runner host, unpack the agent, change into the agent directory, and run `./config.sh`.
+
+    > **NOTE:** you may be prompted to install .NET and other required dependencies prior to running `config.sh`. This can be done by executing the following command (while in the `myagent` directory, or wherever you unpacked the `vsts-agent`).
+
+    ```bash
+    sudo ./bin/installdependencies.sh
+    ```
+
+  - When prompted, register the agent to `https://dev.azure.com/{your-org}` (this should be the `Enter server URL` step)
+  - For authentication type, it is highly recommended to use `SP` (Service Principal). Though, you can choose other options as [documented here](https://learn.microsoft.com/en-us/azure/devops/pipelines/agents/agent-authentication-options?view=azure-devops). If using `SP`, you'll input `Client(App) ID`, `Tenant ID`, and `Client secret`. These are generated/found on [Step 9](#step-9-register-azure-ad-application-service-principal).
+  - After successfully connecting to Azure via these credentials, you'll be prompted to `Enter agent pool`. Input the name of the pool you created in Step 1, or press `Enter` if you used the `Default` pool.
+  - Input agent name (or press `Enter` to use hostname as default).
+
+4. Run the agent as a service:
+
+```bash
+cd ~/myagent
+sudo ./svc.sh install
+sudo ./svc.sh start
+sudo ./svc.sh status
+```
+
+5. Verify the runner before pointing the pipeline at it.
+  - In Azure DevOps, confirm the agent shows **Online** in the selected pool.
+  - Select the runner and check the agent **Capabilities** tab and confirm the machine exposes Linux system capabilities.
+  
+  > **NOTE:** If you install software after registration, restart the agent so Azure DevOps refreshes capabilities.
+
+6. Switch this pipeline to use the self-hosted pool.
+  - Replace the `pool` block in `pipelines/manage-container.yml` with your pool name.
+  - If the pool contains mixed agents, add `demands` so only compatible Linux runners pick up the job.
+
+Example with optional `demands`:
+
+```yaml
+pool:
+  name: your-self-hosted-pool
+  demands:
+   - Agent.OS -equals Linux
+```
+
+Microsoft references:
+- [Azure Pipelines agents overview](https://learn.microsoft.com/en-us/azure/devops/pipelines/agents/agents?view=azure-devops&tabs=yaml%2Cbrowser)
+- [Self-hosted Linux agent install guide](https://learn.microsoft.com/en-us/azure/devops/pipelines/agents/linux-agent?view=azure-devops)
+- [Create and manage agent pools](https://learn.microsoft.com/en-us/azure/devops/pipelines/agents/pools-queues?view=azure-devops)
 
 ### Step 4: Get New Relic Credentials
 
@@ -243,7 +352,9 @@ sudo -u azpipeline docker run --rm hello-world
 
 > Replace `YOUR_PUBLIC_KEY_HERE` with the actual contents of `~/.ssh/azure-pipeline-key.pub` from [Step 5](#step-5-generate-ssh-key-pair).
 
-> **Host prerequisites:** Docker and the `docker-compose` CLI. No Python or additional packages are needed on the host — all scripting logic runs on the Microsoft-hosted pipeline runner.
+> **Host prerequisites:** Docker and the `docker-compose` CLI. No Python or additional packages are needed on the host.
+
+> **Runner prerequisites:** All Python and config-generation logic runs on the Azure Pipelines runner. If you keep the default Microsoft-hosted `ubuntu-latest` pool, no extra runner setup is required. If you switch to a self-hosted runner, use a Linux agent with `bash`, `python3`, `pip`, and GNU-compatible CLI tools such as `base64`.
 
 ### Step 9: Register Azure AD Application (Service Principal)
 
